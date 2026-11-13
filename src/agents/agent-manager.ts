@@ -24,6 +24,22 @@ import type { SubagentType } from "./types.js";
 import { addUsage, getLifetimeTotal, getSessionContextPercent, type AgentUsage } from "./usage.js";
 import { errorMessage } from "../utils.js";
 
+/**
+ * Emit `session_shutdown` to a child session's extensions before disposing it.
+ * Mirrors what pi does before replacing a session, so extensions can clear timers
+ * they bound to that session's ctx. Best effort: a failing handler must not block teardown.
+ */
+function emitChildSessionShutdown(session: AgentSession | undefined): void {
+  if (!session) return;
+  try {
+    const runner = session.extensionRunner;
+    if (!runner?.hasHandlers("session_shutdown")) return;
+    void runner.emit({ type: "session_shutdown", reason: "quit" }).catch(() => {});
+  } catch {
+    // Runner already torn down; nothing left to stop.
+  }
+}
+
 /** How often to check for expired agent records (milliseconds). */
 const CLEANUP_INTERVAL_MS = 60_000;
 
@@ -622,6 +638,10 @@ export class AgentManager {
 
   /** Dispose a record's session and remove it from the map. */
   private removeRecord(id: string, record: AgentRecord): void {
+    // dispose() does not emit session_shutdown, so extension timers registered with the
+    // child session (auto-sync, health checks) would keep firing against a stale ctx and
+    // crash the whole process on the first unguarded ui call. Stop them first.
+    emitChildSessionShutdown(record.execution.session);
     record.execution.session?.dispose();
     record.execution.session = undefined;
     this.agents.delete(id);
@@ -646,6 +666,7 @@ export class AgentManager {
     clearInterval(this.cleanupInterval);
     this.queue = [];
     for (const record of this.agents.values()) {
+      emitChildSessionShutdown(record.execution.session);
       record.execution.session?.dispose();
     }
     this.agents.clear();
